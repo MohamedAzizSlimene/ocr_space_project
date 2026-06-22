@@ -1,8 +1,9 @@
 import os
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-import requests
-from json_parsing import parse_ocr_response
+import requests as http_requests
+import json_parsing
+from groq_parsing import parse_with_groq
 
 load_dotenv()
 
@@ -10,61 +11,71 @@ app = Flask(__name__)
 
 OCR_API_KEY = os.getenv("OCR_API_KEY")
 OCR_API_URL = os.getenv("OCR_API_URL")
-OCR_ENGINE = os.getenv("OCR_ENGINE", "3")
-OCR_LANGUAGE = os.getenv("OCR_LANGUAGE", "ara")
-FLASK_HOST = os.getenv("FLASK_HOST", "0.0.0.0")
-FLASK_PORT = int(os.getenv("FLASK_PORT", "5000"))
-FLASK_DEBUG = os.getenv("FLASK_DEBUG", "True").lower() in ("true", "1", "yes")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+FLASK_DEBUG = os.getenv("FLASK_DEBUG")
+FLASK_PORT = os.getenv("FLASK_PORT")
+
+def extract_ocr_text(image_file):
+    """Send image to ocr.space and return the parsed text."""
+    payload = {
+        'apikey': OCR_API_KEY,
+        'language': 'ara',
+        'OCREngine': '3',
+        'isTable': 'true'
+    }
+    files = {
+        'file': (image_file.filename, image_file.stream, image_file.content_type)
+    }
+    response = http_requests.post(OCR_API_URL, data=payload, files=files)
+
+    if response.status_code != 200:
+        return None, response.status_code
+
+    ocr_result = response.json()
+    parsed_text = ocr_result.get("ParsedResults", [{}])[0].get("ParsedText", "")
+    return parsed_text, 200
 
 
-@app.route("/", methods=["GET"])
-def index():
+@app.route('/ocr', methods=['POST'])
+def ocr_endpoint():
+    """Original endpoint - uses rule-based parsing (Tunisian cards)."""
+    if 'image' not in request.files:
+        return jsonify({"error": "No image file provided"}), 400
+
+    image_file = request.files['image']
+    parsed_text, status = extract_ocr_text(image_file)
+
+    if parsed_text is None:
+        return jsonify({"error": "OCR API request failed", "status_code": status}), 500
+
+    parsed_data = json_parsing.parse_ocr_response(parsed_text)
+
     return jsonify({
-        "status": "running",
-        "message": "Arabic OCR API is running. Use POST /ocr to process an image."
+        "parsed_data": parsed_data,
+        "raw_text": parsed_text
     })
 
 
-@app.route("/ocr", methods=["POST"])
-def ocr():
-    # Check if file is provided
-    if "file" not in request.files:
-        return jsonify({"error": "No file provided. Please upload an image using the 'file' field."}), 400
+@app.route('/arabic/upload/license', methods=['POST'])
+def arabic_upload_license():
+    """New endpoint - uses Groq LLM for intelligent parsing (any Arabic document)."""
+    if 'image' not in request.files:
+        return jsonify({"error": "No image file provided"}), 400
 
-    file = request.files["file"]
+    image_file = request.files['image']
+    parsed_text, status = extract_ocr_text(image_file)
 
-    if file.filename == "":
-        return jsonify({"error": "No file selected."}), 400
+    if parsed_text is None:
+        return jsonify({"error": "OCR API request failed", "status_code": status}), 500
 
-    try:
-        # Send image to ocr.space API
-        response = requests.post(
-            OCR_API_URL,
-            files={"file": (file.filename, file.read(), file.content_type)},
-            headers={"apikey": OCR_API_KEY},
-            data={
-                "OCREngine": OCR_ENGINE,
-                "language": OCR_LANGUAGE
-            }
-        )
+    # Use Groq LLM to intelligently parse the OCR text
+    groq_result = parse_with_groq(parsed_text, GROQ_API_KEY)
 
-        # Check if the API request was successful
-        if response.status_code != 200:
-            return jsonify({
-                "error": "OCR API request failed.",
-                "status_code": response.status_code,
-                "details": response.text
-            }), 502
-
-        result = response.json()
-        parsed = parse_ocr_response(result)
-        raw_text = result.get("ParsedResults", [{}])[0].get("ParsedText", "")
-        raw_text_lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
-        return jsonify({"parsed": parsed, "raw_text_lines": raw_text_lines, "raw_text": raw_text})
-
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": "Failed to connect to OCR API.", "details": str(e)}), 500
+    return jsonify({
+        "groq_parsed": groq_result,
+        "raw_text": parsed_text
+    })
 
 
-if __name__ == "__main__":
-    app.run(host=FLASK_HOST, port=FLASK_PORT, debug=FLASK_DEBUG)
+if __name__ == '__main__':
+    app.run(debug=FLASK_DEBUG, port=FLASK_PORT)
